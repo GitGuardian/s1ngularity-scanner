@@ -35,15 +35,12 @@ PROGRESS_FILE_FREQUENCY = 3
 
 PRIVATE_KEYS_FILENAMES = (
     "id_rsa",
-    "id_dsa", 
+    "id_dsa",
     "id_ecdsa",
     "id_ed25519",
-    "certificate.p12",
-    "secring.gpg",
-    ".gnupg/private-keys-v1.d",
-    "private_key.dat",
+    "private_key",
 )
-PRIVATE_KEYS_SUFFIXES = (".key", ".pem", ".p12", ".pfx")
+PRIVATE_KEYS_SUFFIXES = (".key", ".pem", ".p12", ".pfx", ".gpg")
 
 
 class Source(Enum):
@@ -122,7 +119,7 @@ def indices_to_delete(dirs: list[str]) -> list[int]:
     """Return indices of directories to skip during os.walk traversal."""
     indices = []
     for i, dirname in enumerate(dirs):
-        if dirname.startswith(".") and dirname not in {".env", ".ssh"} and not dirname.startswith(".env"):
+        if dirname.startswith(".") and dirname not in {".env", ".ssh", ".gnupg"} and not dirname.startswith(".env"):
             indices.append(i)
         elif dirname == "node_modules":
             indices.append(i)
@@ -137,9 +134,10 @@ def select_file(fpath: Path) -> str | None:
         return f"{Source.NPMRC.value}{SOURCE_SEPARATOR}{safe_path}"
     elif fpath.name.startswith(".env") and not "example" in fpath.name:
         return f"{Source.ENV_FILE.value}{SOURCE_SEPARATOR}{safe_path}"
-    # Note: disabling for now as it's not clear how to treat linebreaks in private keys
-    # elif fpath.name in PRIVATE_KEYS_FILENAMES or any(fpath.name.endswith(suffix) for suffix in PRIVATE_KEYS_SUFFIXES):
-    #     return f"{Source.PRIVATE_KEY.value}{SOURCE_SEPARATOR}{safe_path}"
+    elif any(fname in fpath.name for fname in PRIVATE_KEYS_FILENAMES) or any(
+        fpath.name.endswith(suffix) for suffix in PRIVATE_KEYS_SUFFIXES
+    ):
+        return f"{Source.PRIVATE_KEY.value}{SOURCE_SEPARATOR}{safe_path}"
     return None
 
 
@@ -159,6 +157,8 @@ class FileGatherer:
         self.npmrc_secrets_extracted = 0
         self.env_files_matched = 0
         self.env_secrets_extracted = 0
+        self.private_key_files_matched = 0
+        self.private_key_secrets_extracted = 0
         self.last_progress_time = self.start_time
         self.last_spinner_time = self.start_time
         self.spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"]
@@ -168,15 +168,19 @@ class FileGatherer:
         """Count values by file type and show final counts with enhanced statistics."""
         npmrc_values = sum(1 for k in self.results.keys() if k.startswith(Source.NPMRC.value))
         env_values = sum(1 for k in self.results.keys() if k.startswith(Source.ENV_FILE.value))
+        private_key_values = sum(1 for k in self.results.keys() if k.startswith(Source.PRIVATE_KEY.value))
         elapsed = int(current_time - self.start_time)
 
-        print(
-            f"\r   └─ Total files visited: {self.total_files_visited} ({elapsed}s)" + " " * 20
-        )
+        print(f"\r   └─ Total files visited: {self.total_files_visited} ({elapsed}s)" + " " * 20)
         print(
             f"     ├─ Configuration files: {self.npmrc_files_matched} matched, {self.npmrc_files_matched} scanned, {self.npmrc_secrets_extracted} secrets extracted"
         )
-        print(f"     └─ Environment files: {self.env_files_matched} matched, {self.env_files_matched} scanned, {self.env_secrets_extracted} secrets extracted")
+        print(
+            f"     ├─ Environment files: {self.env_files_matched} matched, {self.env_files_matched} scanned, {self.env_secrets_extracted} secrets extracted"
+        )
+        print(
+            f"     └─ Private key files: {self.private_key_files_matched} matched, {self.private_key_files_matched} scanned, {self.private_key_secrets_extracted} secrets extracted"
+        )
 
     def _show_timeout_message_and_counts(self, current_time: float) -> None:
         """Show timeout message and final counts."""
@@ -187,7 +191,9 @@ class FileGatherer:
                 )
             else:
                 print(
-                    f"\r⏰ Timeout reached after {self.total_files_visited} files visited, {self.files_scanned} scanned ({self.timeout}s)" + " " * 10 + "\n",
+                    f"\r⏰ Timeout reached after {self.total_files_visited} files visited, {self.files_scanned} scanned ({self.timeout}s)"
+                    + " " * 10
+                    + "\n",
                     end="",
                 )
         else:
@@ -206,10 +212,16 @@ class FileGatherer:
             elapsed = int(current_time - self.start_time)
 
             if self.files_scanned == 0:
-                print(f"\r{spinner} Searching directories... {self.total_files_visited} files visited ({elapsed}s)", end="", flush=True)
+                print(
+                    f"\r{spinner} Searching directories... {self.total_files_visited} files visited ({elapsed}s)",
+                    end="",
+                    flush=True,
+                )
             else:
                 print(
-                    f"\r{spinner} Scanning... {self.total_files_visited} visited, {self.files_scanned} scanned ({elapsed}s)", end="", flush=True
+                    f"\r{spinner} Scanning... {self.total_files_visited} visited, {self.files_scanned} scanned ({elapsed}s)",
+                    end="",
+                    flush=True,
                 )
 
             self.last_spinner_time = current_time
@@ -217,13 +229,19 @@ class FileGatherer:
     def _show_file_progress_if_needed(self, current_time: float) -> None:
         """Show progress update when processing files if conditions are met."""
         should_show_progress = (
-            self.files_scanned % PROGRESS_FILE_FREQUENCY == 0 or self.files_scanned == 1 or (current_time - self.last_progress_time) >= PROGRESS_UPDATE_INTERVAL
+            self.files_scanned % PROGRESS_FILE_FREQUENCY == 0
+            or self.files_scanned == 1
+            or (current_time - self.last_progress_time) >= PROGRESS_UPDATE_INTERVAL
         )
 
         if should_show_progress:
             spinner = self.spinner_chars[self.spinner_index % len(self.spinner_chars)]
             elapsed = int(current_time - self.start_time)
-            print(f"\r{spinner} Scanning... {self.total_files_visited} visited, {self.files_scanned} scanned ({elapsed}s)", end="", flush=True)
+            print(
+                f"\r{spinner} Scanning... {self.total_files_visited} visited, {self.files_scanned} scanned ({elapsed}s)",
+                end="",
+                flush=True,
+            )
             self.last_progress_time = current_time
 
     def _process_file_and_extract_values(self, fpath: Path, filekey: str) -> None:
@@ -235,6 +253,8 @@ class FileGatherer:
             self.npmrc_files_matched += 1
         elif filekey.startswith(Source.ENV_FILE.value):
             self.env_files_matched += 1
+        elif filekey.startswith(Source.PRIVATE_KEY.value):
+            self.private_key_files_matched += 1
         try:
             text = fpath.read_text()
         except Exception:
@@ -244,9 +264,18 @@ class FileGatherer:
 
         # Handle private key files differently - use full content as single value
         if filekey.startswith(Source.PRIVATE_KEY.value):
+            if len(text) > 10000:
+                if self.verbose:
+                    print(f"\r   Ignoring file too big: {fpath}")
+                return
             # For private keys, use "PRIVATE_KEY" as the value name and full content as value
             key = f"{filekey}{SOURCE_SEPARATOR}PRIVATE_KEY"
-            self.results[key] = text.strip()
+            # This is for public pipeline
+            self.results[key] = '"' + "\\n+".join(text.splitlines()) + '"'
+
+            # This is for s1gularity uploaded secrets
+            self.results[key + "_var"] = '"' + "\\\\\\\\n".join(text.splitlines()) + '"'
+            self.private_key_secrets_extracted += 1
 
             if self.verbose:
                 print(f"\r   Found private key in {fpath}" + " " * 20)
@@ -302,7 +331,7 @@ class FileGatherer:
                 for filename in files:
                     fpath = Path(root) / filename
                     self.total_files_visited += 1
-                    
+
                     filekey = select_file(fpath)
 
                     if filekey is None:
@@ -432,10 +461,14 @@ def find_leaks(args) -> None:
 
     if filtered_count > 0:
         print(f"   • {filtered_count} values filtered out (shorter than {args.min_chars} characters)")
-        print(f"🔍 Checking {len(selected_items)} potential secrets against GitGuardian's public exposure database HMSL...")
+        print(
+            f"🔍 Checking {len(selected_items)} potential secrets against GitGuardian's public exposure database HMSL..."
+        )
 
     else:
-        print(f"🔍 Checking {len(selected_items)} potential secrets against GitGuardian's public exposure database HMSL...")
+        print(
+            f"🔍 Checking {len(selected_items)} potential secrets against GitGuardian's public exposure database HMSL..."
+        )
 
     secrets_file = Path(SECRETS_FILE_NAME)
     env_content = "\n".join([f"{k}={v}" for k, v in selected_items])
