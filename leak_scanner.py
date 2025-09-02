@@ -14,6 +14,7 @@ import time
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from dataclasses import dataclass
 
 # Configuration constants
 MIN_PYTHON_VERSION = (3, 9)
@@ -43,6 +44,41 @@ PRIVATE_KEYS_FILENAMES = (
 PRIVATE_KEYS_SUFFIXES = (".key", ".pem", ".p12", ".pfx", ".gpg")
 
 
+@dataclass
+class SecretMetadata:
+    """Store metadata about where a secret came from."""
+    source_type: str
+    source_path: str
+    secret_name: str
+
+
+class SecretTracker:
+    """Track secrets with clean metadata instead of encoded keys."""
+    
+    def __init__(self):
+        self.secrets = {}  # key -> secret_value
+        self.metadata = {}  # key -> SecretMetadata
+        self._counter = 0
+    
+    def add_secret(self, source_type: str, source_path: str, secret_name: str, secret_value: str) -> str:
+        """Add a secret and return its key for ggshield."""
+        self._counter += 1
+        key = f"{source_type}{KEY_SEPARATOR}{self._counter}"
+        
+        self.secrets[key] = secret_value
+        self.metadata[key] = SecretMetadata(source_type, source_path, secret_name)
+        
+        return key
+    
+    def get_metadata(self, key: str) -> SecretMetadata:
+        """Get metadata for a key."""
+        return self.metadata.get(key)
+    
+    def get_secrets_for_ggshield(self) -> dict[str, str]:
+        """Get the key=value pairs for ggshield."""
+        return self.secrets.copy()
+
+
 class Source(Enum):
     ENV_VAR = "ENVIRONMENT_VAR"
     GITHUB_TOKEN = "GITHUB_TOKEN"
@@ -52,7 +88,10 @@ class Source(Enum):
 
 
 # Source tracking constants
-SOURCE_SEPARATOR = "__"
+KEY_SEPARATOR = "|"
+
+# Global tracker instance
+_secret_tracker = None
 
 assignment_regex = re.compile(
     r"""
@@ -126,18 +165,16 @@ def indices_to_delete(dirs: list[str]) -> list[int]:
     return indices
 
 
-def select_file(fpath: Path) -> str | None:
-    """Return the file key prefix if this file should be processed."""
-    # Use our enhanced path encoding for safety
-    safe_path = str(fpath).replace("/", "__SLASH__").replace(".", "__DOT__")
+def select_file(fpath: Path) -> tuple[str, str] | None:
+    """Return (source_type, file_path) if this file should be processed."""
     if fpath.name == ".npmrc":
-        return f"{Source.NPMRC.value}{SOURCE_SEPARATOR}{safe_path}"
+        return (Source.NPMRC.value, str(fpath))
     elif fpath.name.startswith(".env") and not "example" in fpath.name:
-        return f"{Source.ENV_FILE.value}{SOURCE_SEPARATOR}{safe_path}"
+        return (Source.ENV_FILE.value, str(fpath))
     elif any(fname in fpath.name for fname in PRIVATE_KEYS_FILENAMES) or any(
         fpath.name.endswith(suffix) for suffix in PRIVATE_KEYS_SUFFIXES
     ):
-        return f"{Source.PRIVATE_KEY.value}{SOURCE_SEPARATOR}{safe_path}"
+        return (Source.PRIVATE_KEY.value, str(fpath))
     return None
 
 
@@ -244,16 +281,17 @@ class FileGatherer:
             )
             self.last_progress_time = current_time
 
-    def _process_file_and_extract_values(self, fpath: Path, filekey: str) -> None:
+    def _process_file_and_extract_values(self, fpath: Path, source_type: str, file_path: str) -> None:
         """Process a single file, extract values, and show results."""
+        global _secret_tracker
         self.files_scanned += 1
 
         # Count file types matched
-        if filekey.startswith(Source.NPMRC.value):
+        if source_type == Source.NPMRC.value:
             self.npmrc_files_matched += 1
-        elif filekey.startswith(Source.ENV_FILE.value):
+        elif source_type == Source.ENV_FILE.value:
             self.env_files_matched += 1
-        elif filekey.startswith(Source.PRIVATE_KEY.value):
+        elif source_type == Source.PRIVATE_KEY.value:
             self.private_key_files_matched += 1
         try:
             text = fpath.read_text()
@@ -263,18 +301,31 @@ class FileGatherer:
             return
 
         # Handle private key files differently - use full content as single value
-        if filekey.startswith(Source.PRIVATE_KEY.value):
+        if source_type == Source.PRIVATE_KEY.value:
             if len(text) > 10000:
                 if self.verbose:
                     print(f"\r   Ignoring file too big: {fpath}")
                 return
-            # For private keys, use "PRIVATE_KEY" as the value name and full content as value
-            key = f"{filekey}{SOURCE_SEPARATOR}PRIVATE_KEY"
+            
+            # For private keys, create multiple variations for different formats
             # This is for public pipeline
-            self.results[key] = '"' + "\\n+".join(text.splitlines()) + '"'
+            key1 = _secret_tracker.add_secret(
+                source_type=source_type,
+                source_path=file_path,
+                secret_name="PRIVATE_KEY",
+                secret_value='"' + "\\n+".join(text.splitlines()) + '"'
+            )
+            self.results[key1] = '"' + "\\n+".join(text.splitlines()) + '"'
 
             # This is for s1gularity uploaded secrets
-            self.results[key + "_var"] = '"' + "\\\\\\\\n".join(text.splitlines()) + '"'
+            key2 = _secret_tracker.add_secret(
+                source_type=source_type,
+                source_path=file_path,
+                secret_name="PRIVATE_KEY_VAR",
+                secret_value='"' + "\\\\\\\\n".join(text.splitlines()) + '"'
+            )
+            self.results[key2] = '"' + "\\\\\\\\n".join(text.splitlines()) + '"'
+            
             self.private_key_secrets_extracted += 1
 
             if self.verbose:
@@ -285,9 +336,9 @@ class FileGatherer:
 
             if values:
                 # Count files that actually have secrets extracted (our enhancement)
-                if filekey.startswith(Source.NPMRC.value):
+                if source_type == Source.NPMRC.value:
                     self.npmrc_secrets_extracted += 1
-                elif filekey.startswith(Source.ENV_FILE.value):
+                elif source_type == Source.ENV_FILE.value:
                     self.env_secrets_extracted += 1
 
             if self.verbose:
@@ -297,7 +348,13 @@ class FileGatherer:
                     print(f"\r   No values found in {fpath}" + " " * 20)
 
             for value in values:
-                key = f"{filekey}{SOURCE_SEPARATOR}{value}"
+                # Add to global tracker
+                key = _secret_tracker.add_secret(
+                    source_type=source_type,
+                    source_path=file_path,
+                    secret_name=value,
+                    secret_value=value
+                )
                 self.results[key] = value
 
     def gather(self) -> dict[str, str]:
@@ -332,12 +389,13 @@ class FileGatherer:
                     fpath = Path(root) / filename
                     self.total_files_visited += 1
 
-                    filekey = select_file(fpath)
+                    file_info = select_file(fpath)
 
-                    if filekey is None:
+                    if file_info is None:
                         continue
 
-                    self._process_file_and_extract_values(fpath, filekey)
+                    source_type, file_path = file_info
+                    self._process_file_and_extract_values(fpath, source_type, file_path)
 
                     # Show progress update when we find files
                     current_time = time.time()
@@ -363,23 +421,6 @@ def gather_files_by_patterns(timeout: int, verbose: bool = False) -> dict[str, s
     return gatherer.gather()
 
 
-def get_source_description(source_part: str) -> str:
-    """Convert source prefix to human-readable description."""
-    source_mapping = {
-        Source.ENV_VAR.value: "Environment variable",
-        Source.GITHUB_TOKEN.value: "GitHub Token (gh auth token)",
-        Source.NPMRC.value: "~/.npmrc",
-    }
-
-    if source_part.startswith(Source.ENV_FILE.value):
-        # Use our enhanced path decoding with __SLASH__/__DOT__
-        path_part = source_part.replace(f"{Source.ENV_FILE.value}{SOURCE_SEPARATOR}", "")
-        return path_part.replace("__SLASH__", "/").replace("__DOT__", ".")
-    elif source_part.startswith(Source.PRIVATE_KEY.value):
-        path_part = source_part.replace(f"{Source.PRIVATE_KEY.value}{SOURCE_SEPARATOR}", "")
-        return path_part.replace("__SLASH__", "/").replace("__DOT__", ".")
-
-    return source_mapping.get(source_part, source_part)
 
 
 def display_leak(i: int, leak: dict[str, Any], source_type: str, source_path: str, secret_part: str) -> None:
@@ -397,36 +438,39 @@ def display_leak(i: int, leak: dict[str, Any], source_type: str, source_path: st
 
 
 def gather_all_secrets(timeout: int, verbose: bool = False) -> dict[str, str]:
-    all_values = {}
+    global _secret_tracker
+    _secret_tracker = SecretTracker()
 
     # Collect environment variables
     env_vars = 0
-    for value in os.environ.values():
-        key = f"{Source.ENV_VAR.value}{SOURCE_SEPARATOR}{value}"
-        all_values[key] = value
+    for name, value in os.environ.items():
+        _secret_tracker.add_secret(
+            source_type=Source.ENV_VAR.value,
+            source_path="Environment variable", 
+            secret_name=name,
+            secret_value=value
+        )
         env_vars += 1
 
     print(f"   ├─ Environment variables: {env_vars} found")
 
     # Collect GitHub token
     gh_token = handle_github_token_command()
-    github_found = False
     if gh_token:
-        key = f"{Source.GITHUB_TOKEN.value}{SOURCE_SEPARATOR}{gh_token}"
-        all_values[key] = gh_token
-        github_found = True
-
-    # Show GitHub token progress
-    if github_found:
+        _secret_tracker.add_secret(
+            source_type=Source.GITHUB_TOKEN.value,
+            source_path="GitHub CLI",
+            secret_name="gh_token", 
+            secret_value=gh_token
+        )
         print(f"   ├─ GitHub token: found")
     else:
         print(f"   ├─ GitHub token: not found")
 
     # Collect files using enhanced FileGatherer
     file_values = gather_files_by_patterns(timeout, verbose)
-    all_values.update(file_values)
 
-    return all_values
+    return _secret_tracker.get_secrets_for_ggshield()
 
 
 def find_leaks(args) -> None:
@@ -500,49 +544,21 @@ def find_leaks(args) -> None:
                 print()
                 for i, leak in enumerate(selected_leaks, 1):
                     key_name = leak.get("name", "")
-                    if SOURCE_SEPARATOR in key_name:
-                        source_part, secret_part = key_name.split(SOURCE_SEPARATOR, 1)
-                        source_path = get_source_description(source_part)
-                        # Determine source type based on the source part
-                        if source_part == Source.ENV_VAR.value:
-                            source_type = "Environment variable"
-                        elif source_part == Source.GITHUB_TOKEN.value:
-                            source_type = "GitHub Token"
-                        elif source_part.startswith(Source.NPMRC.value):
-                            source_type = "Configuration file"
-                        elif source_part.startswith(Source.ENV_FILE.value):
-                            source_type = "Environment file"
-                        elif source_part.startswith(Source.PRIVATE_KEY.value):
-                            source_type = "Private key file"
-                        else:
-                            source_type = "Unknown"
-
-                        # Special handling for ENV_FILE where encoded path+secret is in secret_part
-                        if source_part == Source.ENV_FILE.value and source_path == "":
-                            encoded_patterns = [
-                                "__SLASH____DOT__env__DOT__production__",
-                                "__SLASH____DOT__env__DOT__test__",
-                                "__SLASH____DOT__env__",
-                            ]
-
-                            for pattern in encoded_patterns:
-                                if pattern in secret_part:
-                                    parts = secret_part.split(pattern, 1)
-                                    if len(parts) == 2:
-                                        filepath_encoded = parts[0] + pattern.rstrip("__")  # Keep the .env part
-                                        actual_secret = parts[1]
-
-                                        # Decode the filepath
-                                        decoded_filepath = filepath_encoded.replace("__SLASH__", "/").replace(
-                                            "__DOT__", "."
-                                        )
-                                        if not decoded_filepath.startswith("/"):
-                                            decoded_filepath = "/" + decoded_filepath
-
-                                        source_path = decoded_filepath
-                                        secret_part = actual_secret
-                                        break
-                        display_leak(i, leak, source_type, source_path, secret_part)
+                    metadata = _secret_tracker.get_metadata(key_name)
+                    
+                    if metadata:
+                        source_type_display = {
+                            Source.ENV_VAR.value: "Environment variable",
+                            Source.GITHUB_TOKEN.value: "GitHub Token", 
+                            Source.NPMRC.value: "Configuration file",
+                            Source.ENV_FILE.value: "Environment file",
+                            Source.PRIVATE_KEY.value: "Private key file"
+                        }.get(metadata.source_type, "Unknown")
+                        
+                        display_leak(i, leak, source_type_display, metadata.source_path, metadata.secret_name)
+                    else:
+                        # This should never happen with the new implementation
+                        display_leak(i, leak, "Unknown", "Unknown", key_name)
                 print("💡 Note: Results may include false positives (non-secret values matching leak patterns).")
                 print("   Always verify results before taking action. If confirmed as real secrets:")
                 print("   1. Immediately revoke and rotate the credential")
