@@ -34,13 +34,50 @@ PROGRESS_UPDATE_INTERVAL = 1.0
 PROGRESS_FILE_FREQUENCY = 3
 
 PRIVATE_KEYS_FILENAMES = (
+    # SSH user keys
     "id_rsa",
     "id_dsa",
     "id_ecdsa",
     "id_ed25519",
     "private_key",
+    # SSH host keys
+    "ssh_host_rsa_key",
+    "ssh_host_dsa_key",
+    "ssh_host_ecdsa_key",
+    "ssh_host_ed25519_key",
+    # Keystores and wallets
+    "keystore",
+    "keystore.json",
+    "wallet",
+    "wallet.dat",
 )
-PRIVATE_KEYS_SUFFIXES = (".key", ".pem", ".p12", ".pfx", ".gpg")
+PRIVATE_KEYS_SUFFIXES = (
+    # Common key formats
+    ".key",
+    ".pem",
+    ".p12",
+    ".pfx",
+    ".gpg",
+    # Additional cryptographic formats
+    ".keyfile",
+    ".jks",           # Java KeyStore
+    ".asc",           # ASCII armored GnuPG
+    ".pgp",           # PGP private key
+    ".prv",           # Generic private key
+    ".pkcs8",         # PKCS#8 format
+    ".pkcs1",         # PKCS#1 format
+    ".kdbx",          # KeePass database
+    # Authentication and cloud keys
+    ".keytab",        # Kerberos keytab
+    ".pvk",           # Private key (Azure)
+    ".ppk",           # PuTTY private key
+    # Cryptocurrency and keychain
+    ".wallet",        # Generic wallet
+    ".seed",          # Seed phrase
+    ".mnemonic",      # Mnemonic phrase
+    ".keychain",      # macOS Keychain
+    ".kdb",           # KeePass database (older)
+)
 
 
 class Source(Enum):
