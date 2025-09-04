@@ -150,8 +150,8 @@ def extract_assigned_values(text: str, with_names: bool = False):
             secret_value = match.group("value")
             variable_value_pairs.append((variable_name, secret_value))
 
-    # Clean up values by removing quotes
-    cleaned_pairs = [(name, remove_quotes(val)) for name, val in variable_value_pairs if remove_quotes(val)]
+    # Clean up values by removing quotes (preserve empty values)
+    cleaned_pairs = [(name, remove_quotes(val)) for name, val in variable_value_pairs]
     
     if with_names:
         return cleaned_pairs
