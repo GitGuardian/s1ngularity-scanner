@@ -96,7 +96,7 @@ _secret_tracker = None
 assignment_regex = re.compile(
     r"""
     ^\s*
-    [a-zA-Z_]\w*
+    (?P<name>[a-zA-Z_]\w*)
     \s*=\s*
     (?P<value>.{1,5000})
 """,
@@ -105,7 +105,7 @@ assignment_regex = re.compile(
 
 json_assignment_regex = re.compile(
     r"""
-    "[a-zA-Z_]\w*"
+    "(?P<name>[a-zA-Z_]\w*)"
     \s*:\s*
     "(?P<value>.{1,5000}?)"
 """,
@@ -119,20 +119,44 @@ def remove_quotes(value: str) -> str:
     return value
 
 
-def extract_assigned_values(text: str) -> set[str]:
-    res = []
+def extract_assigned_values(text: str, with_names: bool = False):
+    """Extract values from assignment text, optionally with variable names.
+    
+    Args:
+        text: Text to parse for assignments
+        with_names: If True, return list of (variable_name, value) tuples
+                   If False, return set of values only
+    
+    Returns:
+        set[str] if with_names=False, list[tuple[str, str]] if with_names=True
+    """
+    variable_value_pairs = []
+    
     for line in text.splitlines():
-        for m in re.finditer(assignment_regex, line):
-            pwd_value = m.group("value")
-            res.append(pwd_value.strip())
-            if "#" in pwd_value:
-                res.append(pwd_value.split("#")[0].strip())
+        # Handle regular assignments like KEY=value
+        for match in re.finditer(assignment_regex, line):
+            variable_name = match.group("name")
+            secret_value = match.group("value").strip()
+            variable_value_pairs.append((variable_name, secret_value))
+            
+            # Handle inline comments
+            if "#" in secret_value:
+                clean_value = secret_value.split("#")[0].strip()
+                variable_value_pairs.append((variable_name, clean_value))
 
-        for m in re.finditer(json_assignment_regex, line):
-            pwd_value = m.group("value")
-            res.append(pwd_value)
+        # Handle JSON assignments like "key": "value"
+        for match in re.finditer(json_assignment_regex, line):
+            variable_name = match.group("name")
+            secret_value = match.group("value")
+            variable_value_pairs.append((variable_name, secret_value))
 
-    return {remove_quotes(val) for val in res}
+    # Clean up values by removing quotes (preserve empty values)
+    cleaned_pairs = [(name, remove_quotes(val)) for name, val in variable_value_pairs]
+    
+    if with_names:
+        return cleaned_pairs
+    else:
+        return {val for name, val in cleaned_pairs}
 
 
 def handle_github_token_command(*args) -> str | None:
@@ -281,9 +305,91 @@ class FileGatherer:
             )
             self.last_progress_time = current_time
 
+    def _process_private_key_file(self, fpath: Path, file_path: str, text: str) -> None:
+        """Process a private key file and extract secrets."""
+        global _secret_tracker
+        
+        if len(text) > 10000:
+            if self.verbose:
+                print(f"\r   Ignoring file too big: {fpath}")
+            return
+        
+        # For private keys, create multiple variations for different formats
+        # This is for public pipeline
+        key1 = _secret_tracker.add_secret(
+            source_type=Source.PRIVATE_KEY.value,
+            source_path=file_path,
+            secret_name="PRIVATE_KEY",
+            secret_value='"' + "\\n+".join(text.splitlines()) + '"'
+        )
+        self.results[key1] = '"' + "\\n+".join(text.splitlines()) + '"'
+
+        # This is for s1gularity uploaded secrets
+        key2 = _secret_tracker.add_secret(
+            source_type=Source.PRIVATE_KEY.value,
+            source_path=file_path,
+            secret_name="PRIVATE_KEY_VAR",
+            secret_value='"' + "\\\\\\\\n".join(text.splitlines()) + '"'
+        )
+        self.results[key2] = '"' + "\\\\\\\\n".join(text.splitlines()) + '"'
+        
+        self.private_key_secrets_extracted += 1
+
+        if self.verbose:
+            print(f"\r   Found private key in {fpath}" + " " * 20)
+
+    def _process_env_file(self, fpath: Path, file_path: str, text: str) -> None:
+        """Process an environment file and extract variable-value pairs."""
+        global _secret_tracker
+        
+        variable_value_pairs = extract_assigned_values(text, with_names=True)
+        
+        if variable_value_pairs:
+            self.env_secrets_extracted += 1
+
+        if self.verbose:
+            if variable_value_pairs:
+                print(f"\r   Found {len(variable_value_pairs)} values in {fpath}" + " " * 20)
+            else:
+                print(f"\r   No values found in {fpath}" + " " * 20)
+
+        for variable_name, secret_value in variable_value_pairs:
+            # Add to global tracker with variable name as secret_name
+            key = _secret_tracker.add_secret(
+                source_type=Source.ENV_FILE.value,
+                source_path=file_path,
+                secret_name=variable_name,
+                secret_value=secret_value
+            )
+            self.results[key] = secret_value
+
+    def _process_config_file(self, fpath: Path, file_path: str, text: str) -> None:
+        """Process a configuration file (NPMRC, etc.) and extract values."""
+        global _secret_tracker
+        
+        secret_values = extract_assigned_values(text, with_names=False)
+
+        if secret_values:
+            self.npmrc_secrets_extracted += 1
+
+        if self.verbose:
+            if secret_values:
+                print(f"\r   Found {len(secret_values)} values in {fpath}" + " " * 20)
+            else:
+                print(f"\r   No values found in {fpath}" + " " * 20)
+
+        for secret_value in secret_values:
+            # Add to global tracker
+            key = _secret_tracker.add_secret(
+                source_type=Source.NPMRC.value,
+                source_path=file_path,
+                secret_name=secret_value,
+                secret_value=secret_value
+            )
+            self.results[key] = secret_value
+
     def _process_file_and_extract_values(self, fpath: Path, source_type: str, file_path: str) -> None:
         """Process a single file, extract values, and show results."""
-        global _secret_tracker
         self.files_scanned += 1
 
         # Count file types matched
@@ -293,6 +399,7 @@ class FileGatherer:
             self.env_files_matched += 1
         elif source_type == Source.PRIVATE_KEY.value:
             self.private_key_files_matched += 1
+            
         try:
             text = fpath.read_text()
         except Exception:
@@ -300,62 +407,13 @@ class FileGatherer:
                 print(f"Failed reading {fpath}")
             return
 
-        # Handle private key files differently - use full content as single value
+        # Delegate to specific processors based on file type
         if source_type == Source.PRIVATE_KEY.value:
-            if len(text) > 10000:
-                if self.verbose:
-                    print(f"\r   Ignoring file too big: {fpath}")
-                return
-            
-            # For private keys, create multiple variations for different formats
-            # This is for public pipeline
-            key1 = _secret_tracker.add_secret(
-                source_type=source_type,
-                source_path=file_path,
-                secret_name="PRIVATE_KEY",
-                secret_value='"' + "\\n+".join(text.splitlines()) + '"'
-            )
-            self.results[key1] = '"' + "\\n+".join(text.splitlines()) + '"'
-
-            # This is for s1gularity uploaded secrets
-            key2 = _secret_tracker.add_secret(
-                source_type=source_type,
-                source_path=file_path,
-                secret_name="PRIVATE_KEY_VAR",
-                secret_value='"' + "\\\\\\\\n".join(text.splitlines()) + '"'
-            )
-            self.results[key2] = '"' + "\\\\\\\\n".join(text.splitlines()) + '"'
-            
-            self.private_key_secrets_extracted += 1
-
-            if self.verbose:
-                print(f"\r   Found private key in {fpath}" + " " * 20)
-        else:
-            # For other files, extract assigned values as before
-            values = extract_assigned_values(text)
-
-            if values:
-                # Count files that actually have secrets extracted (our enhancement)
-                if source_type == Source.NPMRC.value:
-                    self.npmrc_secrets_extracted += 1
-                elif source_type == Source.ENV_FILE.value:
-                    self.env_secrets_extracted += 1
-
-            if self.verbose:
-                if values:
-                    print(f"\r   Found {len(values)} values in {fpath}" + " " * 20)
-                else:
-                    print(f"\r   No values found in {fpath}" + " " * 20)
-
-            for value in values:
-                # Add to global tracker
-                key = _secret_tracker.add_secret(
-                    source_type=source_type,
-                    source_path=file_path,
-                    secret_name=value,
-                    secret_value=value
-                )
-                self.results[key] = value
+            self._process_private_key_file(fpath, file_path, text)
+        elif source_type == Source.ENV_FILE.value:
+            self._process_env_file(fpath, file_path, text)
+        else:  # NPMRC and other config files
+            self._process_config_file(fpath, file_path, text)
 
     def gather(self) -> dict[str, str]:
         """Main method to gather files and return results."""
@@ -423,12 +481,35 @@ def gather_files_by_patterns(timeout: int, verbose: bool = False) -> dict[str, s
 
 
 
-def display_leak(i: int, leak: dict[str, Any], source_type: str, source_path: str, secret_part: str) -> None:
+# Display field mappings for different secret types
+DISPLAY_FIELD_LABELS = {
+    Source.ENV_VAR.value: ("Environment variable", "Path"),
+    Source.GITHUB_TOKEN.value: ("GitHub token", "Source"), 
+    Source.ENV_FILE.value: ("Variable name", "Environment file"),
+    Source.NPMRC.value: ("Configuration value", "Configuration file"),
+    Source.PRIVATE_KEY.value: ("Key type", "Private key file"),
+}
+
+def display_leak(i: int, leak: dict[str, Any], metadata: SecretMetadata) -> None:
     """Display a single leaked secret with formatting."""
     print(f"🔑 Secret #{i}")
-    print(f"   Name: {secret_part}")
-    print(f"   Source: {source_type}")
-    print(f"   Path: {source_path}")
+    
+    # Get field labels for this secret type
+    name_label, path_label = DISPLAY_FIELD_LABELS.get(
+        metadata.source_type, 
+        ("Name", "Path")  # Fallback labels
+    )
+    
+    # Display the secret information with appropriate labels
+    if metadata.source_type == Source.PRIVATE_KEY.value:
+        # Private keys show path first, then type
+        print(f"   {path_label}: {metadata.source_path}")
+        print(f"   {name_label}: {metadata.secret_name}")
+    else:
+        # Other types show name/variable first, then path
+        print(f"   {name_label}: {metadata.secret_name}")
+        print(f"   {path_label}: {metadata.source_path}")
+    
     print(f"   Hash: {leak.get('hash', '')}")
     count = leak.get("count", 0)
     print(f"   Locations: {count} distinct Public GitHub repositories")
@@ -547,18 +628,11 @@ def find_leaks(args) -> None:
                     metadata = _secret_tracker.get_metadata(key_name)
                     
                     if metadata:
-                        source_type_display = {
-                            Source.ENV_VAR.value: "Environment variable",
-                            Source.GITHUB_TOKEN.value: "GitHub Token", 
-                            Source.NPMRC.value: "Configuration file",
-                            Source.ENV_FILE.value: "Environment file",
-                            Source.PRIVATE_KEY.value: "Private key file"
-                        }.get(metadata.source_type, "Unknown")
-                        
-                        display_leak(i, leak, source_type_display, metadata.source_path, metadata.secret_name)
+                        display_leak(i, leak, metadata)
                     else:
-                        # This should never happen with the new implementation
-                        display_leak(i, leak, "Unknown", "Unknown", key_name)
+                        # This should never happen with the new implementation  
+                        fallback_metadata = SecretMetadata("Unknown", "Unknown", key_name)
+                        display_leak(i, leak, fallback_metadata)
                 print("💡 Note: Results may include false positives (non-secret values matching leak patterns).")
                 print("   Always verify results before taking action. If confirmed as real secrets:")
                 print("   1. Immediately revoke and rotate the credential")
